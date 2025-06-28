@@ -11,339 +11,433 @@
  * Learn more at https://developers.cloudflare.com/workers/
  */
 
-import { XMLBuilder } from 'fast-xml-parser';
+import { fetchProgramInfo, fetchSRData, generatePodcastRSS, type SREpisode } from './feed-generator';
 
 interface Env {
 	// Add any environment variables here if needed
 }
 
-interface SREpisode {
-	id: string;
-	title: string;
-	description: string;
-	publishdateutc: string;
-	url: string;
-	imageurl?: string;
-	listenpodfile?: {
-		url: string;
-		duration: number;
-		filesizeinbytes: number;
-		title?: string;
-		description?: string;
-	};
-	downloadpodfile?: {
-		url: string;
-		duration: number;
-		filesizeinbytes: number;
-		title?: string;
-		description?: string;
-	};
-	broadcast?: {
-		availablestoputc?: string;
-		playlist?: {
-			id: string;
-			url: string;
-			statkey: string;
-			duration: number;
-			publishdateutc: string;
-		};
-		broadcastfiles?: Array<{
-			id: string;
-			url: string;
-			statkey: string;
-			duration: number;
-			publishdateutc: string;
-		}>;
-	};
-	program: {
-		id: string;
-		name: string;
-	};
-}
-
-interface SRProgram {
-	id: string;
-	name: string;
-	description?: string;
-	programimage?: string;
-	programurl?: string;
-	category?: {
-		id: number;
-		name: string;
-	};
-	channel?: {
-		name: string;
-	};
-}
-
-// Mapping from Swedish Radio categories to iTunes categories
-function mapSRCategoryToiTunes(srCategoryId?: number): { category: string; subcategory?: string } {
-	if (!srCategoryId) {
-		return { category: 'Society & Culture' };
-	}
-
-	const categoryMap: Record<number, { category: string; subcategory?: string }> = {
-		// Children's programs
-		2: { category: 'Kids & Family', subcategory: 'Stories for Kids' }, // Barn 3 - 8 år
-		132: { category: 'Kids & Family', subcategory: 'Education for Kids' }, // Barn 9 - 13 år
-
-		// Content types
-		82: { category: 'Society & Culture', subcategory: 'Documentary' }, // Dokumentär
-		134: { category: 'Fiction', subcategory: 'Drama' }, // Drama
-		133: { category: 'Comedy' }, // Humor
-
-		// Subject areas
-		135: { category: 'Business' }, // Ekonomi
-		136: { category: 'History' }, // Historia
-		3: { category: 'Arts' }, // Kultur/Nöje
-		14: { category: 'Health & Fitness' }, // Livsstil
-		4: { category: 'Religion & Spirituality', subcategory: 'Philosophy' }, // Livsåskådning
-		5: { category: 'Music' }, // Musik
-		12: { category: 'Science', subcategory: 'Nature' }, // Vetenskap/Miljö
-
-		// News and society
-		11: { category: 'News' }, // News in other languages
-		68: { category: 'News', subcategory: 'Daily News' }, // Nyheter
-		7: { category: 'Society & Culture' }, // Samhälle
-
-		// Sports
-		10: { category: 'Sports' }, // Sport
-	};
-
-	return categoryMap[srCategoryId] || { category: 'Society & Culture' };
-}
-
-function formatRFC2822Date(dateString: string): string {
-	let date: Date;
-
-	// Handle .NET JSON date format: "/Date(1746158460000)/"
-	const dotNetDateMatch = dateString.match(/\/Date\((\d+)\)\//);
-	if (dotNetDateMatch) {
-		const timestamp = parseInt(dotNetDateMatch[1], 10);
-		date = new Date(timestamp);
-	} else {
-		// Handle SR API date format: "2012-09-15 18:03:00Z"
-		// Convert to ISO format if needed by replacing space with 'T'
-		let isoDateString = dateString;
-		if (dateString.includes(' ') && dateString.endsWith('Z')) {
-			isoDateString = dateString.replace(' ', 'T');
-		}
-
-		date = new Date(isoDateString);
-	}
-
-	// Check if date is valid
-	if (isNaN(date.getTime())) {
-		console.error(`Invalid date string: ${dateString}`);
-		return ''; // Return empty string for invalid dates
-	}
-
-	return date.toUTCString();
-}
-
-async function fetchSRData(url: string): Promise<any> {
-	const response = await fetch(url, {
-		headers: {
-			'User-Agent': 'Play/3435 CFNetwork/3826.500.131 Darwin/24.5.0',
-		},
-	});
-
-	if (!response.ok) {
-		throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-	}
-
-	return await response.json();
-}
-
-async function fetchProgramInfo(programId: string): Promise<SRProgram | null> {
-	try {
-		const url = `http://api.sr.se/api/v2/programs/${programId}?format=json`;
-		const data = await fetchSRData(url);
-
-		if (data?.program) {
-			const program = data.program;
-			return {
-				id: String(program.id || programId),
-				name: program.name || '',
-				description: program.description || '',
-				programimage: program.programimage || '',
-				programurl: program.programurl || '',
-				category: program.programcategory
-					? {
-							id: program.programcategory.id,
-							name: program.programcategory.name,
-					  }
-					: undefined,
-			};
-		}
-
-		return null;
-	} catch (error) {
-		console.error('Failed to fetch program info:', error);
-		return null;
-	}
-}
-
-function generatePodcastRSS(
-	episodes: SREpisode[],
-	program?: SRProgram | null,
-	feedUrl?: string,
-	fileType: 'download' | 'broadcast' = 'download'
-): string {
-	const firstEpisode = episodes[0];
-	const programName = program?.name || firstEpisode?.program?.name || 'Unknown Program';
-	const programDescription = program?.description || `Episodes from ${programName}`;
-	const programImage = program?.programimage || firstEpisode?.imageurl || '';
-	const programUrl = program?.programurl || firstEpisode?.url || '';
-
-	// Map SR category to iTunes category
-	const itunesCategory = mapSRCategoryToiTunes(program?.category?.id);
-
-	// Build RSS structure as JavaScript object
-	const rssObj: any = {
-		'?xml': {
-			'@_version': '1.0',
-			'@_encoding': 'UTF-8',
-		},
-		rss: {
-			'@_version': '2.0',
-			'@_xmlns:itunes': 'http://www.itunes.com/dtds/podcast-1.0.dtd',
-			'@_xmlns:content': 'http://purl.org/rss/1.0/modules/content/',
-			'@_xmlns:atom': 'http://www.w3.org/2005/Atom',
-			'@_xmlns:podcast': 'https://podcastindex.org/namespace/1.0',
-			channel: {
-				title: programName,
-				link: programUrl,
-				description: programDescription,
-				language: 'sv-se',
-				copyright: '© Sveriges Radio',
-				'itunes:author': 'Sveriges Radio',
-				'itunes:explicit': 'false',
-				'podcast:locked': 'false',
-				item: [],
-			},
-		},
-	};
-
-	// Add iTunes category
-	if (itunesCategory.subcategory) {
-		rssObj.rss.channel['itunes:category'] = {
-			'@_text': itunesCategory.category,
-			'itunes:category': {
-				'@_text': itunesCategory.subcategory,
-			},
-		};
-	} else {
-		rssObj.rss.channel['itunes:category'] = {
-			'@_text': itunesCategory.category,
-		};
-	}
-
-	// Add optional channel elements
-	if (programImage) {
-		rssObj.rss.channel['itunes:image'] = {
-			'@_href': programImage,
-		};
-	}
-
-	if (feedUrl) {
-		rssObj.rss.channel['atom:link'] = {
-			'@_href': feedUrl,
-			'@_rel': 'self',
-			'@_type': 'application/rss+xml',
-		};
-	}
-
-	// Add episodes
-	for (const episode of episodes) {
-		// Select pod file based on fileType parameter
-		let podFile;
-		if (fileType === 'broadcast') {
-			// For broadcast, get the first broadcast file from the array
-			const broadcastFiles = episode.broadcast?.broadcastfiles;
-
-			if (broadcastFiles && broadcastFiles.length > 0) {
-				const broadcastFile = broadcastFiles[0];
-				// Create a compatible interface for broadcast files
-				podFile = {
-					url: broadcastFile.url,
-					duration: broadcastFile.duration,
-					filesizeinbytes: 0, // Broadcast files don't have filesize
-					title: episode.title, // Use episode title since broadcast files don't have title
-					description: episode.description, // Use episode description since broadcast files don't have description
-				};
-			} else {
-				// Skip episodes without broadcast files when filetype=broadcast
-				console.log(`Skipping episode ${episode.id}: no broadcast file available`);
-				continue;
+function getProgramsHTML(): string {
+	return `<!DOCTYPE html>
+<html lang="sv">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>Sveriges Radio Podcast Feeds</title>
+		<style>
+			body {
+				font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+				max-width: 1200px;
+				margin: 0 auto;
+				padding: 20px;
+				background-color: #f5f5f5;
 			}
-		} else {
-			podFile = episode.downloadpodfile || episode.listenpodfile;
-		}
+			h1 {
+				color: #333;
+				text-align: center;
+				margin-bottom: 30px;
+			}
+			.loading {
+				text-align: center;
+				padding: 40px;
+				color: #666;
+			}
+			.spinner {
+				border: 4px solid #f3f3f3;
+				border-top: 4px solid #007bff;
+				border-radius: 50%;
+				width: 40px;
+				height: 40px;
+				animation: spin 1s linear infinite;
+				margin: 0 auto 20px;
+			}
+			@keyframes spin {
+				0% { transform: rotate(0deg); }
+				100% { transform: rotate(360deg); }
+			}
+			.error {
+				background: #f8d7da;
+				color: #721c24;
+				padding: 15px;
+				border-radius: 4px;
+				margin: 20px 0;
+				text-align: center;
+			}
+			.filter-bar {
+				background: white;
+				border-radius: 8px;
+				box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+				padding: 20px;
+				margin-bottom: 20px;
+			}
+			.search-box {
+				width: 100%;
+				padding: 12px 16px;
+				border: 1px solid #ddd;
+				border-radius: 6px;
+				font-size: 16px;
+				margin-bottom: 10px;
+				box-sizing: border-box;
+			}
+			.filter-row {
+				display: flex;
+				justify-content: space-between;
+				align-items: center;
+				margin-top: 10px;
+			}
+			.checkbox-label {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				font-size: 14px;
+				color: #666;
+				cursor: pointer;
+			}
+			.checkbox-label input[type="checkbox"] {
+				margin: 0;
+				cursor: pointer;
+			}
+			.stats {
+				color: #666;
+				font-size: 14px;
+			}
+			.table-container {
+				background: white;
+				border-radius: 8px;
+				box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+				overflow: hidden;
+			}
+			table {
+				width: 100%;
+				border-collapse: collapse;
+			}
+			th, td {
+				padding: 12px 15px;
+				text-align: left;
+				border-bottom: 1px solid #eee;
+			}
+			th {
+				background-color: #f8f9fa;
+				font-weight: 600;
+				color: #495057;
+			}
+			tr:hover { background-color: #f8f9fa; }
+			tr.hidden { display: none; }
+			a {
+				color: #007bff;
+				text-decoration: none;
+			}
+			a:hover { text-decoration: underline; }
+			.pod-link, .broadcast-link {
+				display: inline-block;
+				padding: 4px 8px;
+				border-radius: 4px;
+				font-size: 12px;
+				font-weight: 500;
+				white-space: nowrap;
+			}
+			.pod-link {
+				background-color: #28a745;
+				color: white;
+			}
+			.broadcast-link {
+				background-color: #17a2b8;
+				color: white;
+			}
+			.pod-link:hover, .broadcast-link:hover {
+				text-decoration: none;
+				opacity: 0.8;
+			}
+			.description {
+				color: #666;
+				font-size: 14px;
+				max-width: 300px;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
 
-		if (!podFile || !podFile.url) {
-			console.log(`Skipping episode ${episode.id}: no audio file available`);
-			continue;
-		}
+			/* Responsive design */
+			@media (max-width: 768px) {
+				body {
+					padding: 10px;
+				}
 
-		const episodeTitle = episode.title || podFile.title || `Episode ${episode.id}`;
-		const episodeDescription = episode.description || podFile.description || '';
-		const pubDate = episode.publishdateutc ? formatRFC2822Date(episode.publishdateutc) : '';
-		const duration = podFile.duration || 0;
-		const fileSize = podFile.filesizeinbytes || 0;
+				.filter-bar {
+					padding: 15px;
+				}
 
-		// Determine MIME type based on URL extension
-		let mimeType = 'audio/mpeg';
-		if (podFile.url.includes('.m4a') || podFile.url.includes('.mp4')) {
-			mimeType = 'audio/mp4';
-		}
+				table {
+					font-size: 14px;
+				}
 
-		const itemObj: any = {
-			title: episodeTitle,
-			description: episodeDescription,
-			enclosure: {
-				'@_url': podFile.url,
-				'@_length': String(fileSize),
-				'@_type': mimeType,
-			},
-			guid: {
-				'@_isPermaLink': 'false',
-				'#text': episode.id,
-			},
-			'itunes:explicit': 'false',
-		};
+				th, td {
+					padding: 8px 10px;
+				}
 
-		if (pubDate) {
-			itemObj.pubDate = pubDate;
-		}
+				/* Hide description column on mobile */
+				th:nth-child(2), td:nth-child(2) {
+					display: none;
+				}
 
-		if (duration > 0) {
-			itemObj['itunes:duration'] = String(duration);
-		}
+				/* Make RSS links more touch-friendly */
+				.pod-link, .broadcast-link {
+					padding: 6px 10px;
+					font-size: 11px;
+				}
+			}
 
-		if (episode.url) {
-			itemObj.link = episode.url;
-		}
+			@media (max-width: 480px) {
+				body {
+					padding: 5px;
+				}
 
-		if (episode.imageurl) {
-			itemObj['itunes:image'] = {
-				'@_href': episode.imageurl,
-			};
-		}
+				h1 {
+					font-size: 24px;
+					margin-bottom: 20px;
+				}
 
-		rssObj.rss.channel.item.push(itemObj);
-	}
+				.filter-bar {
+					padding: 10px;
+				}
 
-	// Build XML using fast-xml-parser
-	const builder = new XMLBuilder({
-		attributeNamePrefix: '@_',
-		ignoreAttributes: false,
-		format: true,
-		indentBy: '  ',
-		suppressEmptyNode: true,
-	});
+				table {
+					font-size: 13px;
+				}
 
-	return builder.build(rssObj);
+				th, td {
+					padding: 6px 8px;
+				}
+
+				.pod-link, .broadcast-link {
+					padding: 8px 12px;
+					font-size: 12px;
+				}
+			}
+		</style>
+	</head>
+	<body>
+		<h1>Sveriges Radio Podcast Feeds</h1>
+
+		<div id="loading" class="loading">
+			<div class="spinner"></div>
+			<p>Laddar program...</p>
+		</div>
+
+		<div id="error" class="error" style="display: none">
+			<p>Ett fel uppstod vid laddning av program. Försök igen senare.</p>
+			<p id="errorDetails" style="font-size: 12px; margin-top: 10px"></p>
+		</div>
+
+		<div id="content" style="display: none">
+			<div class="filter-bar">
+				<input type="text" class="search-box" placeholder="Sök program..." id="searchBox" />
+				<div class="filter-row">
+					<label class="checkbox-label">
+						<input type="checkbox" id="includeArchived" />
+						<span>Inkludera arkiverade program</span>
+					</label>
+					<div class="stats" id="stats">Visar alla program</div>
+				</div>
+			</div>
+
+			<div class="table-container">
+				<table>
+					<thead>
+						<tr>
+							<th>Program</th>
+							<th>Beskrivning</th>
+							<th>Pod Feed</th>
+							<th>Broadcast Feed</th>
+						</tr>
+					</thead>
+					<tbody id="programsTable"></tbody>
+				</table>
+			</div>
+		</div>
+
+		<script>
+			const baseUrl = window.location.href.split('?')[0];
+			let currentSearch = '';
+			let includeArchived = false;
+			let programs = [];
+
+			function renderProgramsTable() {
+				const tbody = document.getElementById('programsTable');
+				tbody.innerHTML = programs
+					.map(
+						(program, index) => \`
+                <tr data-name="\${program.name.toLowerCase()}" data-index="\${index}" data-archived="\${program.archived || false}">
+                    <td><strong>\${program.name}</strong></td>
+                    <td class="description">\${program.description || ''}</td>
+                    <td>\${program.haspod ? \`<a href="\${baseUrl}?programid=\${program.id}&filetype=download" class="pod-link" onclick="copyToClipboard(event, '\${baseUrl}?programid=\${program.id}&filetype=download')">Pod RSS</a>\` : '-'}</td>
+                    <td>\${program.hasondemand ? \`<a href="\${baseUrl}?programid=\${program.id}&filetype=broadcast" class="broadcast-link" onclick="copyToClipboard(event, '\${baseUrl}?programid=\${program.id}&filetype=broadcast')">Broadcast RSS</a>\` : '-'}</td>
+                </tr>
+            \`
+					)
+					.join('');
+			}
+
+			function copyToClipboard(event, url) {
+				// Prevent default link behavior on left click
+				event.preventDefault();
+
+				// Copy URL to clipboard
+				navigator.clipboard.writeText(url).then(() => {
+					// Show temporary feedback
+					const link = event.target;
+					const originalText = link.textContent;
+					link.textContent = 'Kopierat!';
+					link.style.backgroundColor = '#28a745';
+
+					setTimeout(() => {
+						link.textContent = originalText;
+						link.style.backgroundColor = '';
+					}, 1000);
+				}).catch(err => {
+					console.error('Failed to copy: ', err);
+					// Fallback: open in new tab if clipboard fails
+					window.open(url, '_blank');
+				});
+			}
+
+			function filterPrograms() {
+				const rows = document.querySelectorAll('tbody tr');
+				let visibleCount = 0;
+
+				rows.forEach((row) => {
+					const name = row.querySelector('td:first-child strong').textContent;
+					const description = row.querySelector('td:nth-child(2)').textContent;
+					const isArchived = row.dataset.archived === 'true';
+
+					let shouldShow = true;
+
+					// Filter by archived status
+					if (!includeArchived && isArchived) {
+						shouldShow = false;
+					}
+
+					// Filter by search term
+					if (shouldShow && currentSearch) {
+						const searchLower = currentSearch.toLowerCase();
+						const nameLower = name.toLowerCase();
+						const descriptionLower = description.toLowerCase();
+						shouldShow = nameLower.includes(searchLower) || descriptionLower.includes(searchLower);
+					}
+
+					if (shouldShow) {
+						row.classList.remove('hidden');
+						visibleCount++;
+					} else {
+						row.classList.add('hidden');
+					}
+				});
+
+				document.getElementById('stats').textContent = \`Visar \${visibleCount} av \${programs.length} program\`;
+			}
+
+			async function fetchPrograms() {
+				try {
+					const apiUrl = 'https://api.sr.se/api/v2/programs/index?format=json&pagination=false';
+
+					// Use JSONP to work around CORS issues
+					const callbackName = 'srProgramsCallback_' + Date.now();
+					const jsonpUrl = \`\${apiUrl}&callback=\${callbackName}\`;
+
+					// Create a promise-based JSONP implementation
+					const data = await new Promise((resolve, reject) => {
+						// Create a unique callback function
+						window[callbackName] = (data) => {
+							resolve(data);
+							// Clean up
+							delete window[callbackName];
+							document.head.removeChild(script);
+						};
+
+						// Create script tag
+						const script = document.createElement('script');
+						script.src = jsonpUrl;
+						script.onerror = () => {
+							reject(new Error('Failed to load programs data'));
+							delete window[callbackName];
+							document.head.removeChild(script);
+						};
+
+						// Set timeout
+						const timeout = setTimeout(() => {
+							reject(new Error('Request timed out'));
+							delete window[callbackName];
+							if (document.head.contains(script)) {
+								document.head.removeChild(script);
+							}
+						}, 10000); // 10 second timeout
+
+						// Override the callback to also clear timeout
+						const originalCallback = window[callbackName];
+						window[callbackName] = (data) => {
+							clearTimeout(timeout);
+							originalCallback(data);
+						};
+
+						// Add script to page
+						document.head.appendChild(script);
+					});
+
+					if (!data?.programs) throw new Error('No programs data received');
+
+					const programsData = Array.isArray(data.programs) ? data.programs : [data.programs];
+
+					programs = programsData
+						.map((program) => ({
+							id: String(program.id),
+							name: program.name || '',
+							description: program.description || '',
+							programimage: program.programimage || '',
+							programurl: program.programurl || '',
+							haspod: program.haspod || false,
+							hasondemand: program.hasondemand || false,
+							archived: program.archived || false,
+							category: program.programcategory
+								? {
+										id: program.programcategory.id,
+										name: program.programcategory.name,
+								  }
+								: undefined,
+						}))
+						.filter(program => program.haspod || program.hasondemand) // Only keep programs that have either pod or ondemand content
+						.sort((a, b) => {
+							return a.name.localeCompare(b.name, 'sv');
+						});
+
+					document.getElementById('loading').style.display = 'none';
+					document.getElementById('content').style.display = 'block';
+
+					renderProgramsTable();
+					filterPrograms();
+				} catch (error) {
+					console.error('Failed to fetch programs:', error);
+					document.getElementById('loading').style.display = 'none';
+					document.getElementById('error').style.display = 'block';
+					document.getElementById('errorDetails').textContent = error.message;
+				}
+			}
+
+			document.addEventListener('DOMContentLoaded', () => {
+				document.getElementById('searchBox').addEventListener('input', (e) => {
+					currentSearch = e.target.value;
+					filterPrograms();
+				});
+
+				document.getElementById('includeArchived').addEventListener('change', (e) => {
+					includeArchived = e.target.checked;
+					filterPrograms();
+				});
+
+				fetchPrograms();
+			});
+		</script>
+	</body>
+</html>`;
 }
 
 export default {
@@ -353,10 +447,15 @@ export default {
 			const programId = url.searchParams.get('programid');
 			const fileType = url.searchParams.get('filetype');
 
+			// If no programid is provided, serve the programs.html file
 			if (!programId) {
-				return new Response('Missing required parameter: programid', {
-					status: 400,
-					headers: { 'Content-Type': 'text/plain' },
+				const htmlContent = getProgramsHTML();
+				return new Response(htmlContent, {
+					status: 200,
+					headers: {
+						'Content-Type': 'text/html; charset=utf-8',
+						'Cache-Control': 'public, max-age=3600', // Cache for 1 hour
+					},
 				});
 			}
 
@@ -381,7 +480,7 @@ export default {
 			}
 
 			// Fetch episodes and program info in parallel
-			const episodesUrl = `http://api.sr.se/api/v2/episodes/index?programid=${programId}&format=json&size=100`;
+			const episodesUrl = `https://api.sr.se/api/v2/episodes/index?programid=${programId}&format=json&size=100`;
 			const [episodesResponse, program] = await Promise.all([fetchSRData(episodesUrl), fetchProgramInfo(programId)]);
 
 			let episodes: SREpisode[] = [];
