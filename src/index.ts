@@ -219,6 +219,16 @@ function getProgramsHTML(): string {
 	<body>
 		<h1>Sveriges Radio Podcast Feeds</h1>
 
+		<div style="background: #e7f3ff; border: 1px solid #b3d9ff; border-radius: 8px; padding: 20px; margin-bottom: 20px;">
+			<h3 style="margin: 0 0 10px 0; color: #0056b3;">Om RSS-flödena</h3>
+			<p style="margin: 0 0 8px 0; color: #333;">
+				<strong>Pod Feed:</strong> Innehåller klippta podd-versioner som ofta finns tillgängliga längre och är optimerade för nedladdning.
+			</p>
+			<p style="margin: 0; color: #333;">
+				<strong>Broadcast Feed:</strong> Innehåller radioutsändningen i de fall det finns (inklusive musik och andra element från den ursprungliga sändningen).
+			</p>
+		</div>
+
 		<div id="loading" class="loading">
 			<div class="spinner"></div>
 			<p>Laddar program...</p>
@@ -447,7 +457,7 @@ export default {
 			const programId = url.searchParams.get('programid');
 			const fileType = url.searchParams.get('filetype');
 
-			// If no programid is provided, serve the programs.html file
+			// If no programid is provided, serve the programs listing page
 			if (!programId) {
 				const htmlContent = getProgramsHTML();
 				return new Response(htmlContent, {
